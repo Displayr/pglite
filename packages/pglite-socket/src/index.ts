@@ -117,7 +117,10 @@ class QueryQueueManager {
       } catch (error) {
         this.log(`query from handler #${query.handlerId} failed:`, error)
         query.reject(error as Error)
-        return
+        // The protocol batch includes Sync, so PGlite has returned to a usable
+        // ready-for-query state. Reject this exchange but keep serving the rest
+        // of the queue instead of leaving `processing` stuck forever.
+        continue
       }
 
       this.log(
@@ -188,6 +191,11 @@ export class PGLiteSocketHandler extends EventTarget {
   private debug: boolean
   private readonly id: number
   private messageBuffer: Buffer = Buffer.alloc(0)
+  // Extended-query protocol messages (Parse/Bind/Describe/Execute) must reach the
+  // shared PGlite backend as one exchange. Keeping this across socket data events is
+  // important because a single exchange can be split across TCP packets.
+  private pendingExchange: Buffer = Buffer.alloc(0)
+  private dataProcessing: Promise<void> = Promise.resolve()
   private idleTimer?: NodeJS.Timeout
   private idleTimeout: number
   private lastActivityTime: number = Date.now()
@@ -245,14 +253,17 @@ export class PGLiteSocketHandler extends EventTarget {
       this.lastActivityTime = Date.now()
       this.resetIdleTimer()
 
-      setImmediate(async () => {
-        try {
+      // `data` events can arrive while the previous one is still waiting for the
+      // shared backend. Process them in order so one handler cannot split its own
+      // exchange across two queue entries.
+      this.dataProcessing = this.dataProcessing
+        .then(async () => {
           await this.handleData(data)
-        } catch (err) {
+        })
+        .catch((err) => {
           this.log('socket on data error: ', err)
           this.handleError(err as Error)
-        }
-      })
+        })
     })
 
     socket.on('error', (err) => {
@@ -320,6 +331,7 @@ export class PGLiteSocketHandler extends EventTarget {
     this.socket = null
     this.active = false
     this.messageBuffer = Buffer.alloc(0)
+    this.pendingExchange = Buffer.alloc(0)
 
     this.log(`detach: handler cleaned up`)
     return this
@@ -397,6 +409,7 @@ export class PGLiteSocketHandler extends EventTarget {
         // Determine message length
         let messageLength = 0
         let isComplete = false
+        let isStartup = false
 
         // Handle startup message (no type byte, just length)
         if (this.messageBuffer.length >= 4) {
@@ -406,6 +419,7 @@ export class PGLiteSocketHandler extends EventTarget {
             const secondInt = this.messageBuffer.readInt32BE(4)
             // PostgreSQL 3.0 protocol version
             if (secondInt === 196608 || secondInt === 0x00030000) {
+              isStartup = true
               messageLength = firstInt
               isComplete = this.messageBuffer.length >= messageLength
             }
@@ -426,7 +440,7 @@ export class PGLiteSocketHandler extends EventTarget {
           break
         }
 
-        // Extract and process complete message
+        // Extract a complete protocol message.
         const message = this.messageBuffer.slice(0, messageLength)
         this.messageBuffer = this.messageBuffer.slice(messageLength)
 
@@ -438,12 +452,24 @@ export class PGLiteSocketHandler extends EventTarget {
           break
         }
 
+        this.pendingExchange = Buffer.concat([this.pendingExchange, message])
+
+        // A simple query is one complete exchange. Extended queries end at Sync;
+        // without this boundary, two connections can interleave Parse from one
+        // query with Bind from another and corrupt the shared unnamed statement.
+        const messageType = isStartup
+          ? undefined
+          : String.fromCharCode(message[0])
+        const exchangeComplete =
+          isStartup || messageType === 'Q' || messageType === 'S'
+        if (!exchangeComplete) continue
+
+        const exchange = this.pendingExchange
+        this.pendingExchange = Buffer.alloc(0)
         let socketWriteError: any = undefined
-        // Queue the query for execution
-        // This allows multiple connections to queue queries simultaneously
         await this.queryQueue.enqueue(
           this.id,
-          new Uint8Array(message),
+          new Uint8Array(exchange),
           (data) => {
             this.log(`handleData: received ${data.length} bytes from PGlite`)
 

@@ -595,6 +595,38 @@ describe(`PGLite Socket Server`, () => {
       }
     }, 30000)
 
+    it('should keep concurrent parameterized protocol exchanges together', async () => {
+      const config = DEBUG_TESTS
+        ? {
+            connectionString: DEBUG_TESTS_REAL_SERVER,
+            connectionTimeoutMillis: 10000,
+            statement_timeout: 5000,
+          }
+        : connectionConfig
+      const clients = Array.from({ length: 8 }, () => new Client(config))
+      await Promise.all(clients.map((otherClient) => otherClient.connect()))
+
+      try {
+        const results = await Promise.all(
+          clients.map((otherClient, index) =>
+            otherClient.query('SELECT $1::text AS label, $2::int AS value', [
+              `client-${index}`,
+              index,
+            ]),
+          ),
+        )
+
+        expect(results.map((result) => result.rows[0])).toEqual(
+          clients.map((_, index) => ({
+            label: `client-${index}`,
+            value: index,
+          })),
+        )
+      } finally {
+        await Promise.all(clients.map((otherClient) => otherClient.end()))
+      }
+    }, 30000)
+
     it('should process pending queries when transaction owner disconnects', async () => {
       // Create a second client connecting to the same server
       let client2: typeof Client.prototype
